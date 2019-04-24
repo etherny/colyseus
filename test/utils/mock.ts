@@ -1,8 +1,8 @@
-import * as msgpack from "notepack.io";
-import * as WebSocket from "ws";
+import msgpack from "notepack.io";
+import WebSocket from "ws";
 import { EventEmitter } from "events";
 
-import { generateId } from "../../src";
+import { generateId, serialize, FossilDeltaSerializer } from "../../src";
 import { Room } from "../../src/Room";
 import { LocalPresence } from './../../src/presence/LocalPresence';
 
@@ -49,7 +49,10 @@ export function createEmptyClient(): any {
 }
 
 export function createDummyClient (options: any = {}): any {
-  let client = new Client(generateId());
+  const id = options.id || generateId();
+  delete options.id;
+
+  let client = new Client(id);
   (<any>client).options = options;
   return client;
 }
@@ -58,6 +61,7 @@ export function awaitForTimeout(ms: number = 200) {
   return new Promise((resolve, reject) => setTimeout(resolve, ms));
 }
 
+@serialize(FossilDeltaSerializer)
 export class DummyRoom extends Room {
   constructor () {
     super(new LocalPresence());
@@ -74,6 +78,7 @@ export class DummyRoom extends Room {
   onMessage(client, message) { this.broadcast(message); }
 }
 
+@serialize(FossilDeltaSerializer)
 export class RoomWithError extends Room {
   constructor () {
     super(new LocalPresence());
@@ -87,7 +92,7 @@ export class RoomWithError extends Room {
   onMessage() {}
 }
 
-
+@serialize(FossilDeltaSerializer)
 export class DummyRoomWithState extends Room {
   constructor () {
     super(new LocalPresence());
@@ -105,28 +110,13 @@ export class DummyRoomWithState extends Room {
   onMessage() {}
 }
 
-export class DummyRoomWithTimeline extends Room {
-  constructor () {
-    super(new LocalPresence());
-    this.useTimeline()
-  }
-
-  requestJoin (options) {
-    return !options.invalid_param
-  }
-
-  onInit () { this.setState({}); }
-  onDispose() {}
-  onJoin() {}
-  onLeave() {}
-  onMessage() {}
-}
-
+@serialize(FossilDeltaSerializer)
 export class RoomVerifyClient extends DummyRoom {
   patchRate = 5000;
   onJoin () {}
 }
 
+@serialize(FossilDeltaSerializer)
 export class RoomWithAsync extends DummyRoom {
   static ASYNC_TIMEOUT = 200;
 
@@ -148,6 +138,7 @@ export class RoomWithAsync extends DummyRoom {
   }
 }
 
+@serialize(FossilDeltaSerializer)
 export class RoomVerifyClientWithLock extends DummyRoom {
   patchRate = 5000;
 
@@ -161,4 +152,47 @@ export class RoomVerifyClientWithLock extends DummyRoom {
     this.lock();
   }
 
+}
+
+export function utf8Read(buff: Buffer, offset: number) {
+  const length = buff.readUInt8(offset++);
+
+  var string = '', chr = 0;
+  for (var i = offset, end = offset + length; i < end; i++) {
+    var byte = buff.readUInt8(i);
+    if ((byte & 0x80) === 0x00) {
+      string += String.fromCharCode(byte);
+      continue;
+    }
+    if ((byte & 0xe0) === 0xc0) {
+      string += String.fromCharCode(
+        ((byte & 0x1f) << 6) |
+        (buff.readUInt8(++i) & 0x3f)
+      );
+      continue;
+    }
+    if ((byte & 0xf0) === 0xe0) {
+      string += String.fromCharCode(
+        ((byte & 0x0f) << 12) |
+        ((buff.readUInt8(++i) & 0x3f) << 6) |
+        ((buff.readUInt8(++i) & 0x3f) << 0)
+      );
+      continue;
+    }
+    if ((byte & 0xf8) === 0xf0) {
+      chr = ((byte & 0x07) << 18) |
+        ((buff.readUInt8(++i) & 0x3f) << 12) |
+        ((buff.readUInt8(++i) & 0x3f) << 6) |
+        ((buff.readUInt8(++i) & 0x3f) << 0);
+      if (chr >= 0x010000) { // surrogate pair
+        chr -= 0x010000;
+        string += String.fromCharCode((chr >>> 10) + 0xD800, (chr & 0x3FF) + 0xDC00);
+      } else {
+        string += String.fromCharCode(chr);
+      }
+      continue;
+    }
+    throw new Error('Invalid byte ' + byte.toString(16));
+  }
+  return string;
 }

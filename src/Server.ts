@@ -1,7 +1,7 @@
-import * as http from 'http';
-import * as net from 'net';
-import * as parseURL from 'url-parse';
-import * as WebSocket from 'ws';
+import http from 'http';
+import net from 'net';
+import url from 'url';
+import WebSocket from 'ws';
 import { ServerOptions as IServerOptions } from 'ws';
 
 import { debugAndPrintError, debugError } from './Debug';
@@ -14,6 +14,9 @@ import { Client, generateId, isValidId } from './index';
 import { decode, Protocol, send } from './Protocol';
 import { RoomConstructor } from './Room';
 import { parseQueryString, registerGracefulShutdown, retry } from './Utils';
+
+import { registerNode, unregisterNode } from './discovery';
+import { LocalPresence } from './presence/LocalPresence';
 
 function noop() {/* tslint:disable:no-empty */}
 function heartbeat() { this.pingCount = 0; }
@@ -37,11 +40,13 @@ export class Server {
   protected pingInterval: NodeJS.Timer;
   protected pingTimeout: number;
 
+  protected processId: string = generateId();
+
   constructor(options: ServerOptions = {}) {
     const { gracefullyShutdown = true } = options;
 
-    this.presence = options.presence;
-    this.matchMaker = new MatchMaker(this.presence);
+    this.presence = options.presence || new LocalPresence();
+    this.matchMaker = new MatchMaker(this.presence, this.processId);
     this.pingTimeout = (options.pingTimeout !== undefined)
       ? options.pingTimeout
       : 1500;
@@ -90,7 +95,15 @@ export class Server {
   }
 
   public listen(port: number, hostname?: string, backlog?: number, listeningListener?: Function) {
-    this.httpServer.listen(port, hostname, backlog, listeningListener);
+    this.httpServer.listen(port, hostname, backlog, () => {
+      if (listeningListener) { listeningListener(); }
+
+      // register node for proxy/service discovery
+      registerNode(this.presence, {
+        addressInfo: this.httpServer.address() as net.AddressInfo,
+        processId: this.processId,
+      });
+    });
   }
 
   public async register(name: string, handler: RoomConstructor, options: any = {}): Promise<RegisteredHandler> {
@@ -98,8 +111,14 @@ export class Server {
   }
 
   public gracefullyShutdown(exit: boolean = true) {
+    unregisterNode(this.presence, {
+      addressInfo: this.httpServer.address() as net.AddressInfo,
+      processId: this.processId,
+    });
+
     return this.matchMaker.gracefullyShutdown().
       then(() => {
+        this.server.close();
         clearInterval(this.pingInterval);
         return this.onShutdownCallback();
       }).
@@ -136,10 +155,11 @@ export class Server {
   protected verifyClient = async (info, next) => {
     const req = info.req;
 
-    const url = parseURL(req.url);
-    req.roomId = url.pathname.substr(1);
+    const parsedURL = url.parse(req.url);
+    const processAndRoomId = parsedURL.pathname.match(/\/[a-zA-Z0-9_\-]+\/([a-zA-Z0-9_\-]+)$/);
+    req.roomId = processAndRoomId && processAndRoomId[1];
 
-    const query = parseQueryString(url.query);
+    const query = parseQueryString(parsedURL.query);
     req.colyseusid = query.colyseusid;
 
     delete query.colyseusid;
@@ -148,14 +168,14 @@ export class Server {
     if (req.roomId) {
       try {
         // TODO: refactor me. this piece of code is repeated on MatchMaker class.
-        const hasReservedSeat = query.sessionId && await this.matchMaker.remoteRoomCall(
+        const hasReservedSeat = query.sessionId && (await this.matchMaker.remoteRoomCall(
           req.roomId,
           'hasReservedSeat',
           [query.sessionId],
-        );
+        ))[1];
 
         if (!hasReservedSeat) {
-          const isLocked = await this.matchMaker.remoteRoomCall(req.roomId, 'locked');
+          const isLocked = (await this.matchMaker.remoteRoomCall(req.roomId, 'locked'))[1];
 
           if (isLocked) {
             return next(false, Protocol.WS_TOO_MANY_CLIENTS, 'maxClients reached.');
@@ -163,12 +183,12 @@ export class Server {
         }
 
         // verify client from room scope.
-        const authResult = await this.matchMaker.remoteRoomCall(
+        const authResult = (await this.matchMaker.remoteRoomCall(
           req.roomId,
           'onAuth',
           [req.options],
           REMOTE_ROOM_LARGE_TIMEOUT,
-        );
+        ))[1];
 
         if (authResult) {
           req.auth = authResult;
@@ -201,7 +221,7 @@ export class Server {
 
     // ensure client has its "colyseusid"
     if (!upgradeReq.colyseusid) {
-      send(client, [Protocol.USER_ID, client.id]);
+      send[Protocol.USER_ID](client);
     }
 
     // set client options
@@ -217,7 +237,7 @@ export class Server {
       this.matchMaker.connectToRoom(client, upgradeReq.roomId).
         catch((e) => {
           debugAndPrintError(e.stack || e);
-          send(client, [Protocol.JOIN_ERROR, roomId, e && e.message]);
+          send[Protocol.JOIN_ERROR](client, (e && e.message) || '');
         });
 
     } else {
@@ -233,14 +253,14 @@ export class Server {
       return;
     }
 
-    if (message[0] === Protocol.JOIN_ROOM) {
+    if (message[0] === Protocol.JOIN_REQUEST) {
       const roomName = message[1];
       const joinOptions = message[2];
 
       joinOptions.clientId = client.id;
 
       if (!this.matchMaker.hasHandler(roomName) && !isValidId(roomName)) {
-        send(client, [Protocol.JOIN_ERROR, roomName, `Error: no available handler for "${roomName}"`]);
+        send[Protocol.JOIN_ERROR](client, `no available handler for "${roomName}"`);
 
       } else {
         //
@@ -251,12 +271,14 @@ export class Server {
         retry(() => {
           return this.matchMaker.onJoinRoomRequest(client, roomName, joinOptions);
         }, 3, 0, [MatchMakeError]).
-          then((roomId) => {
-            send(client, [Protocol.JOIN_ROOM, roomId, joinOptions.requestId]);
+          then((response: {roomId: string, processId: string}) => {
+            send[Protocol.JOIN_REQUEST](client, joinOptions.requestId, response.roomId, response.processId);
 
           }).catch((e) => {
-            debugError(`MatchMakeError: ${message}\n${e.stack}`);
-            send(client, [Protocol.JOIN_ERROR, roomName, e && e.message]);
+            const errorMessage = (e && e.message) || '';
+            debugError(`MatchMakeError: ${errorMessage}\n${e.stack}`);
+
+            send[Protocol.JOIN_ERROR](client, errorMessage);
           });
       }
 
@@ -265,7 +287,7 @@ export class Server {
       const roomName = message[2];
 
       this.matchMaker.getAvailableRooms(roomName).
-        then((rooms) => send(client, [Protocol.ROOM_LIST, requestId, rooms])).
+        then((rooms) => send[Protocol.ROOM_LIST](client, requestId, rooms)).
         catch((e) => debugAndPrintError(e.stack || e));
 
     } else {

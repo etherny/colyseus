@@ -1,12 +1,12 @@
-import * as http from "http";
-import * as express from "express";
-import * as bodyParser from "body-parser";
-// import * as WebSocket from "uws";
+import http from "http";
+import express from "express";
+import bodyParser from "body-parser";
+// import WebSocket from "uws";
 
 import { Server } from "../src/Server";
 import { ChatRoom } from "./ChatRoom";
 
-const port = Number(process.env.PORT || 2657);
+const port = Number(process.env.PORT || 2567);
 const endpoint = "localhost";
 
 const app = express();

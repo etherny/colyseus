@@ -1,7 +1,7 @@
-import * as assert from "assert";
-import * as msgpack from "notepack.io";
-import * as sinon from 'sinon';
-import * as WebSocket from "ws";
+import assert from "assert";
+import msgpack from "notepack.io";
+import sinon from 'sinon';
+import WebSocket from "ws";
 
 import { Room } from "../src/Room";
 import { MatchMaker } from './../src/MatchMaker';
@@ -10,10 +10,10 @@ import { Protocol } from "../src/Protocol";
 import {
   createDummyClient,
   DummyRoom,
-  DummyRoomWithTimeline,
   DummyRoomWithState,
   RoomWithAsync,
 } from "./utils/mock";
+import { generateId } from "../src";
 
 describe('Room', function() {
   let clock: sinon.SinonFakeTimers;
@@ -33,11 +33,6 @@ describe('Room', function() {
       assert.ok(room instanceof DummyRoom);
     });
 
-    it('should instantiate with timeline attribute', function() {
-      var room = new DummyRoomWithTimeline();
-      assert.equal(0, room.timeline.history.length);
-    });
-
   });
 
   describe('#onJoin/#onLeave', function() {
@@ -49,9 +44,7 @@ describe('Room', function() {
       (<any>room)._onJoin(client, {});
 
       assert.equal(client.messages.length, 1);
-
-      message = msgpack.decode(client.messages[0]);
-      assert.equal(message[0], Protocol.JOIN_ROOM);
+      assert.equal((client.messages[0] as Buffer).readUInt8(0), Protocol.JOIN_ROOM);
     });
 
     it('should receive JOIN_ROOM and ROOM_STATE messages onJoin', function() {
@@ -60,9 +53,9 @@ describe('Room', function() {
 
       (<any>room)._onJoin(client, {});
 
-      assert.equal(client.messages.length, 2);
-      assert.equal(client.getMessageAt(0)[0], Protocol.JOIN_ROOM);
-      assert.equal(client.getMessageAt(1)[0], Protocol.ROOM_STATE);
+      assert.equal(client.messages.length, 3);
+      assert.equal((client.messages[0] as Buffer).readUInt8(0), Protocol.JOIN_ROOM);
+      assert.equal((client.messages[1] as Buffer).readUInt8(0), Protocol.ROOM_STATE);
     });
 
     it('should close client connection only after onLeave has fulfiled', function(done) {
@@ -74,7 +67,7 @@ describe('Room', function() {
       (<any>room)._onJoin(client);
       (<any>room)._onMessage(client, msgpack.encode([Protocol.LEAVE_ROOM]));
 
-      assert.equal(client.getMessageAt(0)[0], Protocol.JOIN_ROOM);
+      assert.equal((client.messages[0] as Buffer).readUInt8(0), Protocol.JOIN_ROOM);
       assert.equal(client.readyState, WebSocket.OPEN);
 
       room.on('disconnect', () => {
@@ -125,9 +118,8 @@ describe('Room', function() {
       // first message
       (<any>room).sendState(client);
 
-      const message = client.getMessageAt(1);
-      assert.equal(message[0], Protocol.ROOM_STATE);
-      assert.deepEqual(msgpack.decode(message[1]), { success: true });
+      assert.equal((client.messages[1] as Buffer).readUInt8(0), Protocol.ROOM_STATE);
+      assert.deepEqual(msgpack.decode(client.messages[2]), { success: true });
     });
   });
 
@@ -135,7 +127,7 @@ describe('Room', function() {
     it('should broadcast data to all clients', function() {
       let room = new DummyRoom();
 
-      // connect 2 dummy clients into room
+      // connect 3 dummy clients into room
       let client1 = createDummyClient();
       (<any>room)._onJoin(client1, {});
 
@@ -147,9 +139,10 @@ describe('Room', function() {
 
       room.broadcast("data");
 
-      assert.equal("data", client1.lastMessage[1]);
-      assert.equal("data", client2.lastMessage[1]);
-      assert.equal("data", client3.lastMessage[1]);
+      assert.equal(Protocol.ROOM_DATA, (client1.messages[1] as Buffer).readUInt8(0));
+      assert.equal("data", client1.lastMessage);
+      assert.equal("data", client2.lastMessage);
+      assert.equal("data", client3.lastMessage);
     });
 
     it('should broadcast data to all clients, except the provided client', function() {
@@ -167,9 +160,38 @@ describe('Room', function() {
 
       room.broadcast("data", { except: client3 });
 
-      assert.equal("data", client1.lastMessage[1]);
-      assert.equal("data", client2.lastMessage[1]);
-      assert.equal(undefined, client3.lastMessage[1]);
+      assert.equal(3, client1.messages.length);
+      assert.equal(3, client2.messages.length);
+      assert.equal(1, client3.messages.length);
+      assert.equal("data", client1.lastMessage);
+      assert.equal("data", client2.lastMessage);
+    });
+
+    it('should broadcast after next patch', function() {
+      const room = new DummyRoom();
+
+      // connect 3 dummy clients into room
+      const client1 = createDummyClient();
+      (<any>room)._onJoin(client1, {});
+      const client2 = createDummyClient();
+      (<any>room)._onJoin(client2, {});
+      const client3 = createDummyClient();
+      (<any>room)._onJoin(client3, {});
+
+      room.broadcast("data", { afterNextPatch: true });
+
+      assert.equal(1, client1.messages.length);
+      assert.equal(1, client2.messages.length);
+      assert.equal(1, client3.messages.length);
+
+      tick(room.patchRate);
+
+      assert.equal(3, client1.messages.length);
+      assert.equal(3, client2.messages.length);
+      assert.equal(3, client3.messages.length);
+      assert.equal("data", client1.lastMessage);
+      assert.equal("data", client2.lastMessage);
+      assert.equal("data", client3.lastMessage);
     });
   });
 
@@ -235,23 +257,23 @@ describe('Room', function() {
       // voila!
       assert.equal(true, (<any>room).broadcastPatch());
 
-      assert.equal(client.messages.length, 3);
-      assert.equal(client2.messages.length, 3);
+      assert.equal(client.messages.length, 5);
+      assert.equal(client2.messages.length, 5);
 
       // first message, join room
-      var message = msgpack.decode(client.messages[0]);
-      assert.equal(message[0], Protocol.JOIN_ROOM);
+      var message = (client.messages[0] as Buffer).readUInt8(0);
+      assert.equal(message, Protocol.JOIN_ROOM);
 
       // second message, room state
-      var message = msgpack.decode(client.messages[1]);
-      assert.equal(message[0], Protocol.ROOM_STATE);
+      var message = (client.messages[1] as Buffer).readUInt8(0);
+      assert.equal(message, Protocol.ROOM_STATE);
 
       // third message, empty patch state
-      var message = msgpack.decode(client.messages[2]);
-      assert.equal(message[0], Protocol.ROOM_STATE_PATCH);
-      assert.deepEqual(message[1].length, 22);
+      var message = (client.messages[3] as Buffer).readUInt8(0);
+      assert.equal(message, Protocol.ROOM_STATE_PATCH);
+      assert.deepEqual(client.messages[4].length, 22);
 
-      assert.deepEqual(message[1], [ 66, 10, 66, 58, 130, 163, 111, 110, 101, 1, 163, 116, 119, 111, 2, 49, 86, 53, 49, 74, 89, 59 ]);
+      assert.deepEqual(client.messages[4], [ 66, 10, 66, 58, 130, 163, 111, 110, 101, 1, 163, 116, 119, 111, 2, 49, 86, 53, 49, 74, 89, 59 ]);
     });
   });
 
@@ -267,7 +289,7 @@ describe('Room', function() {
         (<any>room)._onJoin(lastClient, {});
       }
 
-      assert.equal(lastClient.lastMessage[0], Protocol.JOIN_ROOM);
+      assert.equal((lastClient.messages[0] as Buffer).readUInt8(0), Protocol.JOIN_ROOM);
       room.disconnect();
 
       assert.deepEqual(room.clients, {});
@@ -312,7 +334,7 @@ describe('Room', function() {
 
       const client = createDummyClient();
       matchMaker.onJoinRoomRequest(client, 'reconnect', {}).
-        then((roomId) => {
+        then(({ roomId }) => {
           const room = matchMaker.getRoomById(roomId);
 
           room.onLeave = function (client) {
@@ -338,8 +360,9 @@ describe('Room', function() {
     });
 
     it("should succeed waiting same sessionId for reconnection", async () => {
-      const firstClient = createDummyClient();
-      const roomId = await matchMaker.onJoinRoomRequest(firstClient, 'reconnect', {});
+      const clientId = generateId();
+      const firstClient = createDummyClient({ id: clientId });
+      const { roomId } = await matchMaker.onJoinRoomRequest(firstClient, 'reconnect', {});
 
       const room = matchMaker.getRoomById(roomId);
       const reconnectionSpy = sinon.spy();
@@ -362,8 +385,8 @@ describe('Room', function() {
       assert.equal(room.clients.length, 0);
       await tick(5 * 1000);
 
-      const secondClient = createDummyClient();
-      const secondRoomId = await matchMaker.onJoinRoomRequest(secondClient, 'reconnect', {
+      const secondClient = createDummyClient({ id: clientId });
+      const { roomId: secondRoomId } = await matchMaker.onJoinRoomRequest(secondClient, 'reconnect', {
         sessionId: firstClient.sessionId
       });
       assert.equal(roomId, secondRoomId);
